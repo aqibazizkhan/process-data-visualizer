@@ -8,8 +8,8 @@ import requests
 import numpy as np
 from datetime import datetime, time
 
-st.set_page_config(page_title="Ultra-Fast Process Visualizer", layout="wide")
-st.title("⚡ Ultra-Fast Process Data Visualizer")
+st.set_page_config(page_title="Process Visualizer", layout="wide")
+st.title("Data Visualizer")
 
 # ---------------------------------------------------------
 # LTTB DOWNSAMPLING ALGORITHM
