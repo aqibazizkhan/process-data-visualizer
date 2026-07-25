@@ -6,32 +6,27 @@ import re
 import io
 import requests
 import numpy as np
+from datetime import datetime, time
 
 st.set_page_config(page_title="Ultra-Fast Process Visualizer", layout="wide")
 st.title("⚡ Ultra-Fast Process Data Visualizer")
 
 # ---------------------------------------------------------
-# LTTB DOWNSAMPLING ALGORITHM (Preserves Spikes & Peaks)
+# LTTB DOWNSAMPLING ALGORITHM
 # ---------------------------------------------------------
 def lttb_downsample(x_data, y_data, threshold=2500):
-    """Downsamples time series data while strictly preserving visual peaks and troughs."""
     data_length = len(x_data)
     if data_length <= threshold or threshold < 3:
         return x_data, y_data
 
-    # Convert to numeric arrays for fast NumPy vectorization
     y = np.asarray(y_data, dtype=np.float64)
     x = np.arange(data_length)
-
-    # Bucket size
     every = (data_length - 2) / (threshold - 2)
     
     a = 0
     sampled_x = [0]
-    sampled_y = [0]
 
     for i in range(0, threshold - 2):
-        # Calculate point average for next bucket (bucket B)
         avg_x_start = int(np.floor((i + 1) * every) + 1)
         avg_x_end = int(np.floor((i + 2) * every) + 1)
         avg_x_end = min(avg_x_end, data_length)
@@ -39,11 +34,9 @@ def lttb_downsample(x_data, y_data, threshold=2500):
         avg_x = np.mean(x[avg_x_start:avg_x_end])
         avg_y = np.nanmean(y[avg_x_start:avg_x_end])
 
-        # Get the range for current bucket (bucket A)
         range_offs = int(np.floor((i + 0) * every) + 1)
         range_to = int(np.floor((i + 1) * every) + 1)
 
-        # Point a
         point_a_x = x[a]
         point_a_y = y[a]
 
@@ -51,7 +44,6 @@ def lttb_downsample(x_data, y_data, threshold=2500):
         max_area_point = range_offs
 
         for j in range(range_offs, range_to):
-            # Calculate triangle area over the bucket
             area = 0.5 * np.abs(
                 (point_a_x - avg_x) * (y[j] - point_a_y) -
                 (point_a_x - x[j]) * (avg_y - point_a_y)
@@ -64,12 +56,11 @@ def lttb_downsample(x_data, y_data, threshold=2500):
         a = max_area_point
 
     sampled_x.append(data_length - 1)
-    
     indices = np.array(sampled_x)
     return x_data.iloc[indices], y_data.iloc[indices]
 
 # ---------------------------------------------------------
-# FAST CACHED LOADERS
+# CACHED LOADERS
 # ---------------------------------------------------------
 @st.cache_data(show_spinner="Processing uploaded file...")
 def load_uploaded_file(file):
@@ -90,36 +81,41 @@ def load_gdrive(url):
             return pd.read_csv(io.BytesIO(res.content)), None
         except Exception:
             return pd.read_excel(io.BytesIO(res.content)), None
-    return None, "Download failed. Check file permissions."
+    return None, "Download failed. Check permissions."
 
 @st.cache_data(show_spinner="Downloading from OneDrive...")
 def load_onedrive(url):
-    if "onedrive.live.com" in url or "1drv.ms" in url:
-        direct_url = url.replace("view.aspx", "download.aspx").replace("redir?", "download?")
-        direct_url += "&download=1" if "?" in direct_url else "?download=1"
-    elif "sharepoint.com" in url:
-        direct_url = url.split("?")[0] + "?download=1" if "?" in url else url + "?download=1"
-    else:
-        direct_url = url
-    res = requests.get(direct_url)
-    if res.status_code == 200:
-        try:
-            return pd.read_csv(io.BytesIO(res.content)), None
-        except Exception:
-            return pd.read_excel(io.BytesIO(res.content)), None
-    return None, "Download failed. Check OneDrive link permissions."
+    try:
+        if "onedrive.live.com" in url or "1drv.ms" in url:
+            direct_url = url.replace("view.aspx", "download.aspx").replace("redir?", "download?")
+            direct_url += "&download=1" if "?" in direct_url else "?download=1"
+        elif "sharepoint.com" in url:
+            direct_url = f"{url.split('?')[0]}?download=1"
+        else:
+            direct_url = url
+
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(direct_url, headers=headers, stream=True, timeout=12)
+        if res.status_code == 200:
+            try:
+                return pd.read_csv(io.BytesIO(res.content)), None
+            except Exception:
+                return pd.read_excel(io.BytesIO(res.content)), None
+        return None, f"OneDrive status {res.status_code}. Check permissions."
+    except Exception as e:
+        return None, f"Error: {e}"
 
 @st.cache_data(show_spinner="Optimizing timestamps...")
 def prepare_data(df, time_col):
     df = df.copy()
-    # Fast vectorized date parsing for m/d/yy HH:MM format (1/1/25 10:50)
+    # Fast date parsing for Month/Day/Year 24hr format (1/1/25 10:50)
     df[time_col] = pd.to_datetime(df[time_col], format="%m/%d/%y %H:%M", errors='coerce')
     if df[time_col].isna().all():
         df[time_col] = pd.to_datetime(df[time_col], format="mixed", dayfirst=False, errors='coerce')
     return df.dropna(subset=[time_col]).sort_values(by=time_col)
 
 # ---------------------------------------------------------
-# UI CONTROLS
+# UI INPUT ROUTING
 # ---------------------------------------------------------
 data_source = st.radio(
     "Select Input Method:", 
@@ -147,72 +143,110 @@ elif data_source == "OneDrive / SharePoint Link":
         if err: st.error(err)
 
 # ---------------------------------------------------------
-# FAST RENDERING ENGINE
+# RENDERING ENGINE & DATE RANGE SELECTION
 # ---------------------------------------------------------
 if raw_df is not None:
     time_col = st.selectbox("Select Timestamp Column", raw_df.columns)
     df = prepare_data(raw_df, time_col)
 
-    numeric_cols = [c for c in df.columns if c != time_col]
-    selected_tags = st.multiselect("Select Process Variables to Plot", numeric_cols, default=numeric_cols[:2])
+    # --- DATE & TIME RANGE SLICER (SIDEBAR) ---
+    st.sidebar.header("🗓️ Date & Time Filter")
+    
+    min_datetime = df[time_col].min().to_pydatetime()
+    max_datetime = df[time_col].max().to_pydatetime()
 
-    if selected_tags:
-        fig = make_subplots(
-            rows=len(selected_tags), 
-            cols=1, 
-            shared_xaxes=True, 
-            vertical_spacing=0.03,
-            subplot_titles=selected_tags
-        )
+    # 1. Date Range Picker
+    date_range = st.sidebar.date_input(
+        "Select Date Range",
+        value=(min_datetime.date(), max_datetime.date()),
+        min_value=min_datetime.date(),
+        max_value=max_datetime.date()
+    )
 
-        st.sidebar.header("Custom Y-Axis Scales")
-        
-        # Max resolution slider for ultra-fine vs. ultra-fast viewing
-        max_pts = st.sidebar.select_slider(
-            "Visual Resolution (Max Points per Plot):",
-            options=[1000, 2500, 5000, 10000, "Full Raw Data"],
-            value=2500
-        )
+    # 2. Time Range Inputs
+    st.sidebar.subheader("Time Range (24hr)")
+    col_t1, col_t2 = st.sidebar.columns(2)
+    with col_t1:
+        start_time_val = st.time_input("Start Time", value=time(0, 0))
+    with col_t2:
+        end_time_val = st.time_input("End Time", value=time(23, 59))
 
-        for i, tag in enumerate(selected_tags, start=1):
-            clean_s = pd.to_numeric(df[tag], errors='coerce')
-            
-            min_val = float(clean_s.min()) if not clean_s.dropna().empty else 0.0
-            max_val = float(clean_s.max()) if not clean_s.dropna().empty else 100.0
+    # Construct combined Start and End Datetime
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_dt = datetime.combine(date_range[0], start_time_val)
+        end_dt = datetime.combine(date_range[1], end_time_val)
+    else:
+        start_dt = datetime.combine(date_range[0], start_time_val)
+        end_dt = datetime.combine(date_range[0], end_time_val)
 
-            st.sidebar.subheader(f"Scale: {tag}")
-            use_custom = st.sidebar.checkbox(f"Custom Min/Max", key=f"check_{tag}")
-            
-            if use_custom:
-                y_min = st.sidebar.number_input(f"{tag} Min", value=min_val, key=f"min_{tag}")
-                y_max = st.sidebar.number_input(f"{tag} Max", value=max_val, key=f"max_{tag}")
+    # Filter dataframe based on selected Date/Time range
+    df_filtered = df[(df[time_col] >= start_dt) & (df[time_col] <= end_dt)]
 
-            # Apply Downsampling if requested
-            if max_pts != "Full Raw Data" and len(df) > max_pts:
-                x_ds, y_ds = lttb_downsample(df[time_col], clean_s, threshold=max_pts)
-            else:
-                x_ds, y_ds = df[time_col], clean_s
+    if df_filtered.empty:
+        st.warning("⚠️ No data found in the selected Date & Time range. Please adjust your filters in the sidebar.")
+    else:
+        st.sidebar.info(f"Showing **{len(df_filtered):,}** points out of **{len(df):,}** total points.")
 
-            # WebGL Line Trace
-            fig.add_trace(
-                go.Scattergl(
-                    x=x_ds, 
-                    y=y_ds, 
-                    name=tag, 
-                    mode='lines',
-                    hovertemplate=f"<b>{tag}</b>: %{{y:.2f}}<extra></extra>"
-                ),
-                row=i, col=1
+        # --- PROCESS VARIABLE SELECTION ---
+        numeric_cols = [c for c in df.columns if c != time_col]
+        selected_tags = st.multiselect("Select Process Variables to Plot", numeric_cols, default=numeric_cols[:2])
+
+        if selected_tags:
+            fig = make_subplots(
+                rows=len(selected_tags), 
+                cols=1, 
+                shared_xaxes=True, 
+                vertical_spacing=0.03,
+                subplot_titles=selected_tags
             )
 
-            if use_custom:
-                fig.update_yaxes(range=[y_min, y_max], row=i, col=1)
+            st.sidebar.header("Custom Y-Axis Scales")
+            
+            max_pts = st.sidebar.select_slider(
+                "Visual Resolution (Max Points per Plot):",
+                options=[1000, 2500, 5000, 10000, "Full Raw Data"],
+                value=2500
+            )
 
-        fig.update_layout(
-            height=260 * len(selected_tags),
-            xaxis_rangeslider_visible=True,
-            hovermode="x unified",
-            showlegend=False
-        )
+            for i, tag in enumerate(selected_tags, start=1):
+                clean_s = pd.to_numeric(df_filtered[tag], errors='coerce')
+                
+                min_val = float(clean_s.min()) if not clean_s.dropna().empty else 0.0
+                max_val = float(clean_s.max()) if not clean_s.dropna().empty else 100.0
 
-        st.plotly_chart(fig, use_container_width=True)
+                st.sidebar.subheader(f"Scale: {tag}")
+                use_custom = st.sidebar.checkbox(f"Custom Min/Max", key=f"check_{tag}")
+                
+                if use_custom:
+                    y_min = st.sidebar.number_input(f"{tag} Min", value=min_val, key=f"min_{tag}")
+                    y_max = st.sidebar.number_input(f"{tag} Max", value=max_val, key=f"max_{tag}")
+
+                # Downsample if needed
+                if max_pts != "Full Raw Data" and len(df_filtered) > max_pts:
+                    x_ds, y_ds = lttb_downsample(df_filtered[time_col], clean_s, threshold=max_pts)
+                else:
+                    x_ds, y_ds = df_filtered[time_col], clean_s
+
+                # Plot trace
+                fig.add_trace(
+                    go.Scattergl(
+                        x=x_ds, 
+                        y=y_ds, 
+                        name=tag, 
+                        mode='lines',
+                        hovertemplate=f"<b>{tag}</b>: %{{y:.2f}}<extra></extra>"
+                    ),
+                    row=i, col=1
+                )
+
+                if use_custom:
+                    fig.update_yaxes(range=[y_min, y_max], row=i, col=1)
+
+            fig.update_layout(
+                height=260 * len(selected_tags),
+                xaxis_rangeslider_visible=True,  # Bottom range slider syncs with selection
+                hovermode="x unified",
+                showlegend=False
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
